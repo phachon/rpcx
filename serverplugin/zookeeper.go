@@ -41,10 +41,20 @@ type ZooKeeperRegisterPlugin struct {
 
 	Options *store.Config
 	kv      store.Store
+
+	dying chan struct{}
+	done  chan struct{}
 }
 
 // Start starts to connect zookeeper cluster
 func (p *ZooKeeperRegisterPlugin) Start() error {
+	if p.done == nil {
+		p.done = make(chan struct{})
+	}
+	if p.dying == nil {
+		p.dying = make(chan struct{})
+	}
+
 	if p.kv == nil {
 		kv, err := libkv.NewStore(store.ZK, p.ZooKeeperServers, p.Options)
 		if err != nil {
@@ -70,36 +80,75 @@ func (p *ZooKeeperRegisterPlugin) Start() error {
 			defer p.kv.Close()
 
 			// refresh service TTL
-			for range ticker.C {
-				var data []byte
-				if p.Metrics != nil {
-					clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
-					data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
-				}
-				//set this same metrics for all services at this server
-				for _, name := range p.Services {
-					nodePath := fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
-					kvPaire, err := p.kv.Get(nodePath)
-					if err != nil {
-						log.Infof("can't get data of node: %s, because of %v", nodePath, err.Error())
-
-						p.metasLock.RLock()
-						meta := p.metas[name]
-						p.metasLock.RUnlock()
-
-						err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+			for {
+				select {
+				case <-p.dying:
+					close(p.done)
+					return
+				case <-ticker.C:
+					var data []byte
+					if p.Metrics != nil {
+						clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
+						data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
+					}
+					//set this same metrics for all services at this server
+					for _, name := range p.Services {
+						nodePath := fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
+						kvPaire, err := p.kv.Get(nodePath)
 						if err != nil {
-							log.Errorf("cannot re-create zookeeper path %s: %v", nodePath, err)
+							log.Infof("can't get data of node: %s, because of %v", nodePath, err.Error())
+
+							p.metasLock.RLock()
+							meta := p.metas[name]
+							p.metasLock.RUnlock()
+
+							err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+							if err != nil {
+								log.Errorf("cannot re-create zookeeper path %s: %v", nodePath, err)
+							}
+						} else {
+							v, _ := url.ParseQuery(string(kvPaire.Value))
+							v.Set("tps", string(data))
+							p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
 						}
-					} else {
-						v, _ := url.ParseQuery(string(kvPaire.Value))
-						v.Set("tps", string(data))
-						p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
 					}
 				}
-
 			}
 		}()
+	}
+
+	return nil
+}
+
+// Stop unregister all services.
+func (p *ZooKeeperRegisterPlugin) Stop() error {
+	close(p.dying)
+	<-p.done
+
+	if p.kv == nil {
+		kv, err := libkv.NewStore(store.ZK, p.ZooKeeperServers, p.Options)
+		if err != nil {
+			log.Errorf("cannot create zk registry: %v", err)
+			return err
+		}
+		p.kv = kv
+	}
+
+	if p.BasePath[0] == '/' {
+		p.BasePath = p.BasePath[1:]
+	}
+
+	for _, name := range p.Services {
+		nodePath := fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
+		exist, err := p.kv.Exists(nodePath)
+		if err != nil {
+			log.Errorf("cannot delete zk path %s: %v", nodePath, err)
+			continue
+		}
+		if exist {
+			p.kv.Delete(nodePath)
+			log.Infof("delete zk path %s", nodePath, err)
+		}
 	}
 
 	return nil
@@ -162,6 +211,63 @@ func (p *ZooKeeperRegisterPlugin) Register(name string, rcvr interface{}, metada
 		p.metas = make(map[string]string)
 	}
 	p.metas[name] = metadata
+	p.metasLock.Unlock()
+	return
+}
+
+func (p *ZooKeeperRegisterPlugin) Unregister(name string) (err error) {
+	if "" == strings.TrimSpace(name) {
+		err = errors.New("Register service `name` can't be empty")
+		return
+	}
+
+	if p.kv == nil {
+		zookeeper.Register()
+		kv, err := libkv.NewStore(store.ZK, p.ZooKeeperServers, nil)
+		if err != nil {
+			log.Errorf("cannot create zk registry: %v", err)
+			return err
+		}
+		p.kv = kv
+	}
+
+	if p.BasePath[0] == '/' {
+		p.BasePath = p.BasePath[1:]
+	}
+	err = p.kv.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
+	if err != nil {
+		log.Errorf("cannot create zk path %s: %v", p.BasePath, err)
+		return err
+	}
+
+	nodePath := fmt.Sprintf("%s/%s", p.BasePath, name)
+	err = p.kv.Put(nodePath, []byte(name), &store.WriteOptions{IsDir: true})
+	if err != nil {
+		log.Errorf("cannot create zk path %s: %v", nodePath, err)
+		return err
+	}
+
+	nodePath = fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
+
+	err = p.kv.Delete(nodePath)
+	if err != nil {
+		log.Errorf("cannot create consul path %s: %v", nodePath, err)
+		return err
+	}
+
+	var services = make([]string, 0, len(p.Services)-1)
+	for _, s := range p.Services {
+		if s != name {
+			services = append(services, s)
+		}
+	}
+	p.Services = services
+
+	p.metasLock.Lock()
+	if p.metas == nil {
+		p.metas = make(map[string]string)
+	}
+	delete(p.metas, name)
 	p.metasLock.Unlock()
 	return
 }

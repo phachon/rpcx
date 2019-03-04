@@ -5,8 +5,11 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
+
+	"github.com/edwingeng/doublejump"
 
 	"github.com/valyala/fastrand"
 )
@@ -42,7 +45,7 @@ type randomSelector struct {
 }
 
 func newRandomSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -60,7 +63,7 @@ func (s randomSelector) Select(ctx context.Context, servicePath, serviceMethod s
 }
 
 func (s *randomSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -75,7 +78,7 @@ type roundRobinSelector struct {
 }
 
 func newRoundRobinSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -84,7 +87,7 @@ func newRoundRobinSelector(servers map[string]string) Selector {
 }
 
 func (s *roundRobinSelector) Select(ctx context.Context, servicePath, serviceMethod string, args interface{}) string {
-	ss := s.servers
+	var ss = s.servers
 	if len(ss) == 0 {
 		return ""
 	}
@@ -96,7 +99,7 @@ func (s *roundRobinSelector) Select(ctx context.Context, servicePath, serviceMet
 }
 
 func (s *roundRobinSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -132,7 +135,7 @@ func (s *weightedRoundRobinSelector) UpdateServer(servers map[string]string) {
 }
 
 func createWeighted(servers map[string]string) []*Weighted {
-	var ss []*Weighted
+	var ss = make([]*Weighted, 0, len(servers))
 	for k, metadata := range servers {
 		w := &Weighted{Server: k, Weight: 1, EffectiveWeight: 1}
 
@@ -202,7 +205,7 @@ func (s *geoSelector) UpdateServer(servers map[string]string) {
 }
 
 func createGeoServer(servers map[string]string) []*geoServer {
-	var geoServers []*geoServer
+	var geoServers = make([]*geoServer, 0, len(servers))
 
 	for s, metadata := range servers {
 		if v, err := url.ParseQuery(metadata); err == nil {
@@ -232,16 +235,18 @@ func createGeoServer(servers map[string]string) []*geoServer {
 
 // consistentHashSelector selects based on JumpConsistentHash.
 type consistentHashSelector struct {
+	h       *doublejump.Hash
 	servers []string
 }
 
 func newConsistentHashSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
 
-	return &consistentHashSelector{servers: ss}
+	sort.Slice(ss, func(i, j int) bool { return ss[i] < ss[j] })
+	return &consistentHashSelector{servers: ss, h: doublejump.NewHash()}
 }
 
 func (s consistentHashSelector) Select(ctx context.Context, servicePath, serviceMethod string, args interface{}) string {
@@ -249,17 +254,27 @@ func (s consistentHashSelector) Select(ctx context.Context, servicePath, service
 	if len(ss) == 0 {
 		return ""
 	}
-	i := JumpConsistentHash(len(ss), servicePath, serviceMethod, args)
-	return ss[i]
+
+	key := genKey(servicePath, serviceMethod, args)
+	return s.h.Get(key).(string)
 }
 
 func (s *consistentHashSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
+		s.h.Add(k)
 		ss = append(ss, k)
 	}
 
+	sort.Slice(ss, func(i, j int) bool { return ss[i] < ss[j] })
+
+	for _, k := range s.servers {
+		if servers[k] == "" { //remove
+			s.h.Remove(k)
+		}
+	}
 	s.servers = ss
+
 }
 
 // weightedICMPSelector selects servers with ping result.

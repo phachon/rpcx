@@ -4,9 +4,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/smallnest/rpcx/util"
+)
+
+var (
+	// Compressors are compressors supported by rpcx. You can add customized compressor in Compressors.
+	Compressors = map[CompressType]Compressor{
+		None: &RawDataCompressor{},
+		Gzip: &GzipCompressor{},
+	}
 )
 
 // MaxMessageLength is the max length of a message.
@@ -18,15 +27,17 @@ const (
 	magicNumber byte = 0x08
 )
 
-var (
-	lineSeparator = []byte("\r\n")
-)
+func MagicNumber() byte {
+	return magicNumber
+}
 
 var (
 	// ErrMetaKVMissing some keys or values are mssing.
 	ErrMetaKVMissing = errors.New("wrong metadata lines. some keys or values are missing")
-	// ErrMessageToLong message is too long
-	ErrMessageToLong = errors.New("message is too long")
+	// ErrMessageTooLong message is too long
+	ErrMessageTooLong = errors.New("message is too long")
+
+	ErrUnsupportedCompressor = errors.New("unsupported compressor")
 )
 
 const (
@@ -76,6 +87,9 @@ const (
 	ProtoBuffer
 	// MsgPack for payload
 	MsgPack
+	// Thrift
+	// Thrift for payload
+	Thrift
 )
 
 // Message is the generic type of Request and Response.
@@ -120,7 +134,7 @@ func (h *Header) SetVersion(v byte) {
 
 // MessageType returns the message type.
 func (h Header) MessageType() MessageType {
-	return MessageType(h[2] & 0x80)
+	return MessageType(h[2]&0x80) >> 7
 }
 
 // SetMessageType sets message type.
@@ -164,7 +178,7 @@ func (h Header) CompressType() CompressType {
 
 // SetCompressType sets the compression type.
 func (h *Header) SetCompressType(ct CompressType) {
-	h[2] = h[2] | ((byte(ct) << 2) & 0x1C)
+	h[2] = (h[2] &^ 0x1C) | ((byte(ct) << 2) & 0x1C)
 }
 
 // MessageStatusType returns the message status type.
@@ -174,7 +188,7 @@ func (h Header) MessageStatusType() MessageStatusType {
 
 // SetMessageStatusType sets message status type.
 func (h *Header) SetMessageStatusType(mt MessageStatusType) {
-	h[2] = h[2] | (byte(mt) & 0x03)
+	h[2] = (h[2] &^ 0x03) | (byte(mt) & 0x03)
 }
 
 // SerializeType returns serialization type of payload.
@@ -184,7 +198,7 @@ func (h Header) SerializeType() SerializeType {
 
 // SetSerializeType sets the serialization type.
 func (h *Header) SetSerializeType(st SerializeType) {
-	h[3] = h[3] | (byte(st) << 4)
+	h[3] = (h[3] &^ 0xF0) | (byte(st) << 4)
 }
 
 // Seq returns sequence number of messages.
@@ -201,6 +215,7 @@ func (h *Header) SetSeq(seq uint64) {
 func (m Message) Clone() *Message {
 	header := *m.Header
 	c := GetPooledMsg()
+	header.SetCompressType(None)
 	c.Header = &header
 	c.ServicePath = m.ServicePath
 	c.ServiceMethod = m.ServiceMethod
@@ -214,7 +229,22 @@ func (m Message) Encode() []byte {
 	spL := len(m.ServicePath)
 	smL := len(m.ServiceMethod)
 
-	totalL := (4 + spL) + (4 + smL) + (4 + len(meta)) + (4 + len(m.Payload))
+	var err error
+	payload := m.Payload
+	if m.CompressType() != None {
+		compressor := Compressors[m.CompressType()]
+		if compressor == nil {
+			m.SetCompressType(None)
+		} else {
+			payload, err = compressor.Zip(m.Payload)
+			if err != nil {
+				m.SetCompressType(None)
+				payload = m.Payload
+			}
+		}
+	}
+
+	totalL := (4 + spL) + (4 + smL) + (4 + len(meta)) + (4 + len(payload))
 
 	// header + dataLen + spLen + sp + smLen + sm + metaL + meta + payloadLen + payload
 	metaStart := 12 + 4 + (4 + spL) + (4 + smL)
@@ -237,8 +267,8 @@ func (m Message) Encode() []byte {
 	binary.BigEndian.PutUint32(data[metaStart:metaStart+4], uint32(len(meta)))
 	copy(data[metaStart+4:], meta)
 
-	binary.BigEndian.PutUint32(data[payLoadStart:payLoadStart+4], uint32(len(m.Payload)))
-	copy(data[payLoadStart+4:], m.Payload)
+	binary.BigEndian.PutUint32(data[payLoadStart:payLoadStart+4], uint32(len(payload)))
+	copy(data[payLoadStart+4:], payload)
 
 	return data
 }
@@ -255,7 +285,19 @@ func (m Message) WriteTo(w io.Writer) error {
 	spL := len(m.ServicePath)
 	smL := len(m.ServiceMethod)
 
-	totalL := (4 + spL) + (4 + smL) + (4 + len(meta)) + (4 + len(m.Payload))
+	payload := m.Payload
+	if m.CompressType() != None {
+		compressor := Compressors[m.CompressType()]
+		if compressor == nil {
+			return ErrUnsupportedCompressor
+		}
+		payload, err = compressor.Zip(m.Payload)
+		if err != nil {
+			return err
+		}
+	}
+
+	totalL := (4 + spL) + (4 + smL) + (4 + len(meta)) + (4 + len(payload))
 	err = binary.Write(w, binary.BigEndian, uint32(totalL))
 	if err != nil {
 		return err
@@ -290,12 +332,12 @@ func (m Message) WriteTo(w io.Writer) error {
 	}
 
 	//write payload
-	err = binary.Write(w, binary.BigEndian, uint32(len(m.Payload)))
+	err = binary.Write(w, binary.BigEndian, uint32(len(payload)))
 	if err != nil {
 		return err
 	}
 
-	_, err = w.Write(m.Payload)
+	_, err = w.Write(payload)
 	return err
 }
 
@@ -328,7 +370,7 @@ func decodeMetadata(l uint32, data []byte) (map[string]string, error) {
 		if n+sl > l-4 {
 			return m, ErrMetaKVMissing
 		}
-		k := util.SliceByteToString(data[n : n+sl])
+		k := string(data[n : n+sl])
 		n = n + sl
 
 		// value
@@ -337,7 +379,7 @@ func decodeMetadata(l uint32, data []byte) (map[string]string, error) {
 		if n+sl > l {
 			return m, ErrMetaKVMissing
 		}
-		v := util.SliceByteToString(data[n : n+sl])
+		v := string(data[n : n+sl])
 		n = n + sl
 		m[k] = v
 	}
@@ -360,7 +402,15 @@ func (m *Message) Decode(r io.Reader) error {
 	// validate rest length for each step?
 
 	// parse header
-	_, err := io.ReadFull(r, m.Header[:])
+	_, err := io.ReadFull(r, m.Header[:1])
+	if err != nil {
+		return err
+	}
+	if !m.Header.CheckMagicNumber() {
+		return fmt.Errorf("wrong magic number: %v", m.Header[0])
+	}
+
+	_, err = io.ReadFull(r, m.Header[1:])
 	if err != nil {
 		return err
 	}
@@ -376,15 +426,20 @@ func (m *Message) Decode(r io.Reader) error {
 	poolUint32Data.Put(lenData)
 
 	if MaxMessageLength > 0 && int(l) > MaxMessageLength {
-		return ErrMessageToLong
+		return ErrMessageTooLong
 	}
 
-	data := make([]byte, int(l))
+	totalL := int(l)
+	if cap(m.data) >= totalL { //reuse data
+		m.data = m.data[:totalL]
+	} else {
+		m.data = make([]byte, totalL)
+	}
+	data := m.data
 	_, err = io.ReadFull(r, data)
 	if err != nil {
 		return err
 	}
-	m.data = data
 
 	n := 0
 	// parse servicePath
@@ -420,6 +475,17 @@ func (m *Message) Decode(r io.Reader) error {
 	n = n + 4
 	m.Payload = data[n:]
 
+	if m.CompressType() != None {
+		compressor := Compressors[m.CompressType()]
+		if compressor == nil {
+			return ErrUnsupportedCompressor
+		}
+		m.Payload, err = compressor.Unzip(m.Payload)
+		if err != nil {
+			return err
+		}
+	}
+
 	return err
 }
 
@@ -427,7 +493,7 @@ func (m *Message) Decode(r io.Reader) error {
 func (m *Message) Reset() {
 	resetHeader(m.Header)
 	m.Metadata = nil
-	m.Payload = m.Payload[:0]
+	m.Payload = []byte{}
 	m.data = m.data[:0]
 	m.ServicePath = ""
 	m.ServiceMethod = ""

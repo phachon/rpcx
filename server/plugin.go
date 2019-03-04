@@ -16,14 +16,22 @@ type PluginContainer interface {
 	All() []Plugin
 
 	DoRegister(name string, rcvr interface{}, metadata string) error
+	DoRegisterFunction(name string, fn interface{}, metadata string) error
+	DoUnregister(name string) error
 
 	DoPostConnAccept(net.Conn) (net.Conn, bool)
+	DoPostConnClose(net.Conn) bool
 
 	DoPreReadRequest(ctx context.Context) error
 	DoPostReadRequest(ctx context.Context, r *protocol.Message, e error) error
 
-	DoPreWriteResponse(context.Context, *protocol.Message) error
+	DoPreHandleRequest(ctx context.Context, req *protocol.Message) error
+
+	DoPreWriteResponse(context.Context, *protocol.Message, *protocol.Message) error
 	DoPostWriteResponse(context.Context, *protocol.Message, *protocol.Message, error) error
+
+	DoPreWriteRequest(ctx context.Context) error
+	DoPostWriteRequest(ctx context.Context, r *protocol.Message, e error) error
 }
 
 // Plugin is the server plugin interface.
@@ -34,6 +42,12 @@ type (
 	// RegisterPlugin is .
 	RegisterPlugin interface {
 		Register(name string, rcvr interface{}, metadata string) error
+		Unregister(name string) error
+	}
+
+	// RegisterFunctionPlugin is .
+	RegisterFunctionPlugin interface {
+		RegisterFunction(name string, fn interface{}, metadata string) error
 	}
 
 	// PostConnAcceptPlugin represents connection accept plugin.
@@ -41,6 +55,11 @@ type (
 	// and this conn has been closed.
 	PostConnAcceptPlugin interface {
 		HandleConnAccept(net.Conn) (net.Conn, bool)
+	}
+
+	// PostConnClosePlugin represents client connection close plugin.
+	PostConnClosePlugin interface {
+		HandleConnClose(net.Conn) bool
 	}
 
 	//PreReadRequestPlugin represents .
@@ -53,14 +72,29 @@ type (
 		PostReadRequest(ctx context.Context, r *protocol.Message, e error) error
 	}
 
+	//PreHandleRequestPlugin represents .
+	PreHandleRequestPlugin interface {
+		PreHandleRequest(ctx context.Context, r *protocol.Message) error
+	}
+
 	//PreWriteResponsePlugin represents .
 	PreWriteResponsePlugin interface {
-		PreWriteResponse(context.Context, *protocol.Message) error
+		PreWriteResponse(context.Context, *protocol.Message, *protocol.Message) error
 	}
 
 	//PostWriteResponsePlugin represents .
 	PostWriteResponsePlugin interface {
 		PostWriteResponse(context.Context, *protocol.Message, *protocol.Message, error) error
+	}
+
+	//PreWriteRequestPlugin represents .
+	PreWriteRequestPlugin interface {
+		PreWriteRequest(ctx context.Context) error
+	}
+
+	//PostWriteRequestPlugin represents .
+	PostWriteRequestPlugin interface {
+		PostWriteRequest(ctx context.Context, r *protocol.Message, e error) error
 	}
 )
 
@@ -112,6 +146,42 @@ func (p *pluginContainer) DoRegister(name string, rcvr interface{}, metadata str
 	return nil
 }
 
+// DoRegisterFunction invokes DoRegisterFunction plugin.
+func (p *pluginContainer) DoRegisterFunction(name string, fn interface{}, metadata string) error {
+	var es []error
+	for _, rp := range p.plugins {
+		if plugin, ok := rp.(RegisterFunctionPlugin); ok {
+			err := plugin.RegisterFunction(name, fn, metadata)
+			if err != nil {
+				es = append(es, err)
+			}
+		}
+	}
+
+	if len(es) > 0 {
+		return errors.NewMultiError(es)
+	}
+	return nil
+}
+
+// DoUnregister invokes RegisterPlugin.
+func (p *pluginContainer) DoUnregister(name string) error {
+	var es []error
+	for _, rp := range p.plugins {
+		if plugin, ok := rp.(RegisterPlugin); ok {
+			err := plugin.Unregister(name)
+			if err != nil {
+				es = append(es, err)
+			}
+		}
+	}
+
+	if len(es) > 0 {
+		return errors.NewMultiError(es)
+	}
+	return nil
+}
+
 //DoPostConnAccept handles accepted conn
 func (p *pluginContainer) DoPostConnAccept(conn net.Conn) (net.Conn, bool) {
 	var flag bool
@@ -125,6 +195,20 @@ func (p *pluginContainer) DoPostConnAccept(conn net.Conn) (net.Conn, bool) {
 		}
 	}
 	return conn, true
+}
+
+//DoPostConnClose handles closed conn
+func (p *pluginContainer) DoPostConnClose(conn net.Conn) bool {
+	var flag bool
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PostConnClosePlugin); ok {
+			flag = plugin.HandleConnClose(conn)
+			if !flag {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // DoPreReadRequest invokes PreReadRequest plugin.
@@ -155,11 +239,25 @@ func (p *pluginContainer) DoPostReadRequest(ctx context.Context, r *protocol.Mes
 	return nil
 }
 
+// DoPreHandleRequest invokes PreHandleRequest plugin.
+func (p *pluginContainer) DoPreHandleRequest(ctx context.Context, r *protocol.Message) error {
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PreHandleRequestPlugin); ok {
+			err := plugin.PreHandleRequest(ctx, r)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // DoPreWriteResponse invokes PreWriteResponse plugin.
-func (p *pluginContainer) DoPreWriteResponse(ctx context.Context, req *protocol.Message) error {
+func (p *pluginContainer) DoPreWriteResponse(ctx context.Context, req *protocol.Message, res *protocol.Message) error {
 	for i := range p.plugins {
 		if plugin, ok := p.plugins[i].(PreWriteResponsePlugin); ok {
-			err := plugin.PreWriteResponse(ctx, req)
+			err := plugin.PreWriteResponse(ctx, req, res)
 			if err != nil {
 				return err
 			}
@@ -174,6 +272,34 @@ func (p *pluginContainer) DoPostWriteResponse(ctx context.Context, req *protocol
 	for i := range p.plugins {
 		if plugin, ok := p.plugins[i].(PostWriteResponsePlugin); ok {
 			err := plugin.PostWriteResponse(ctx, req, resp, e)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// DoPreWriteRequest invokes PreWriteRequest plugin.
+func (p *pluginContainer) DoPreWriteRequest(ctx context.Context) error {
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PreWriteRequestPlugin); ok {
+			err := plugin.PreWriteRequest(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// DoPostWriteRequest invokes PostWriteRequest plugin.
+func (p *pluginContainer) DoPostWriteRequest(ctx context.Context, r *protocol.Message, e error) error {
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PostWriteRequestPlugin); ok {
+			err := plugin.PostWriteRequest(ctx, r, e)
 			if err != nil {
 				return err
 			}

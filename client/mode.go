@@ -10,6 +10,8 @@ const (
 	Failfast
 	//Failtry use current client again
 	Failtry
+	//Failbackup select another server if the first server doesn't respon in specified time and use the fast response.
+	Failbackup
 )
 
 // SelectMode defines the algorithm of selecting a services from candidates.
@@ -32,16 +34,3 @@ const (
 	// SelectByUser is selecting by implementation of users
 	SelectByUser = 1000
 )
-
-var selectModeStrs = [...]string{
-	"RandomSelect",
-	"RoundRobin",
-	"WeightedRoundRobin",
-	"WeightedICMP",
-	"ConsistentHash",
-	"Closest",
-}
-
-func (s SelectMode) String() string {
-	return selectModeStrs[s]
-}

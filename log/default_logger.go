@@ -55,11 +55,15 @@ func (l *defaultLogger) Fatalf(format string, v ...interface{}) {
 }
 
 func (l *defaultLogger) Panic(v ...interface{}) {
-	l.Logger.Panic(v)
+	l.Logger.Panic(v...)
 }
 
 func (l *defaultLogger) Panicf(format string, v ...interface{}) {
 	l.Logger.Panicf(format, v...)
+}
+
+func (l *defaultLogger) Handle(v ...interface{}) {
+	l.Error(v...)
 }
 
 func header(lvl, msg string) string {

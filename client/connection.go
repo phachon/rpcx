@@ -13,6 +13,10 @@ import (
 	"github.com/smallnest/rpcx/share"
 )
 
+type makeConnFn func(c *Client, network, address string) (net.Conn, error)
+
+var makeConnMap = make(map[string]makeConnFn)
+
 // Connect connects the server via specified network.
 func (c *Client) Connect(network, address string) error {
 	var conn net.Conn
@@ -28,7 +32,12 @@ func (c *Client) Connect(network, address string) error {
 	case "unix":
 		conn, err = newDirectConn(c, network, address)
 	default:
-		conn, err = newDirectConn(c, network, address)
+		fn := makeConnMap[network]
+		if fn != nil {
+			conn, err = fn(c, network, address)
+		} else {
+			conn, err = newDirectConn(c, network, address)
+		}
 	}
 
 	if err == nil && conn != nil {
@@ -72,8 +81,13 @@ func newDirectConn(c *Client, network, address string) (net.Conn, error) {
 	}
 
 	if err != nil {
-		log.Errorf("failed to dial server: %v", err)
+		log.Warnf("failed to dial server: %v", err)
 		return nil, err
+	}
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
 	return conn, nil

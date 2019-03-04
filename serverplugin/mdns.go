@@ -32,6 +32,9 @@ type MDNSRegisterPlugin struct {
 
 	server *zeroconf.Server
 	domain string
+
+	dying chan struct{}
+	done  chan struct{}
 }
 
 // NewMDNSRegisterPlugin return a new MDNSRegisterPlugin.
@@ -46,6 +49,8 @@ func NewMDNSRegisterPlugin(serviceAddress string, port int, m metrics.Registry, 
 		Metrics:        m,
 		UpdateInterval: updateInterval,
 		domain:         domain,
+		dying:          make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -61,27 +66,33 @@ func (p *MDNSRegisterPlugin) Start() error {
 		go func() {
 			defer p.server.Shutdown()
 
-			// refresh service TTL
-			for range ticker.C {
-				if p.server == nil && len(p.Services) == 0 {
-					continue
-				}
+			for {
+				// refresh service TTL
+				select {
+				case <-p.dying:
+					close(p.done)
+					return
+				case <-ticker.C:
+					if p.server == nil && len(p.Services) == 0 {
+						break
+					}
 
-				var data []byte
-				if p.Metrics != nil {
-					clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
-					data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
-				}
+					var data []byte
+					if p.Metrics != nil {
+						clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
+						data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
+					}
 
-				//set this same metrics for all services at this server
-				for _, sm := range p.Services {
-					v, _ := url.ParseQuery(string(sm.Meta))
-					v.Set("tps", string(data))
-					sm.Meta = v.Encode()
+					//set this same metrics for all services at this server
+					for _, sm := range p.Services {
+						v, _ := url.ParseQuery(string(sm.Meta))
+						v.Set("tps", string(data))
+						sm.Meta = v.Encode()
+					}
+					ss, _ := json.Marshal(p.Services)
+					s := url.QueryEscape(string(ss))
+					p.server.SetText([]string{s})
 				}
-				ss, _ := json.Marshal(p.Services)
-				s := url.QueryEscape(string(ss))
-				p.server.SetText([]string{s})
 			}
 		}()
 	}
@@ -89,6 +100,14 @@ func (p *MDNSRegisterPlugin) Start() error {
 	return nil
 }
 
+// Stop unregister all services.
+func (p *MDNSRegisterPlugin) Stop() error {
+	close(p.dying)
+	<-p.done
+
+	p.server.Shutdown()
+	return nil
+}
 func (p *MDNSRegisterPlugin) initMDNS() {
 	data, _ := json.Marshal(p.Services)
 	s := url.QueryEscape(string(data))
@@ -148,5 +167,31 @@ func (p *MDNSRegisterPlugin) Register(name string, rcvr interface{}, metadata st
 	ss, _ := json.Marshal(p.Services)
 	s := url.QueryEscape(string(ss))
 	p.server.SetText([]string{s})
+	return
+}
+
+func (p *MDNSRegisterPlugin) Unregister(name string) (err error) {
+	if "" == strings.TrimSpace(name) {
+		err = errors.New("Register service `name` can't be empty")
+		return
+	}
+
+	var services = make([]*serviceMeta, 0, len(p.Services)-1)
+	for _, meta := range p.Services {
+		if meta.Service != name {
+			services = append(services, meta)
+		}
+	}
+	p.Services = services
+
+	ss, _ := json.Marshal(p.Services)
+	s := url.QueryEscape(string(ss))
+	p.server.SetText([]string{s})
+
+	// if p.server != nil {
+	// 	p.server.Shutdown()
+	// 	return
+	// }
+
 	return
 }
